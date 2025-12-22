@@ -1,8 +1,5 @@
 ﻿using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -10,98 +7,72 @@ var builder = WebApplication.CreateBuilder(args);
 var serverUrl = Environment.GetEnvironmentVariable("HEAP_SORT_SERVER_URL");
 if (!string.IsNullOrWhiteSpace(serverUrl))
 {
-    var normalizedUrls = serverUrl
-        .Split(';', StringSplitOptions.RemoveEmptyEntries)
-        .Select(NormalizeServerUrl)
-        .ToArray();
-
-    if (normalizedUrls.Length > 0)
-    {
-        builder.WebHost.UseUrls(normalizedUrls);
-    }
+    builder.WebHost.UseUrls(serverUrl);
 }
 
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
-Directory.CreateDirectory(dataDirectory);
-
-var logsDirectory = Path.Combine(dataDirectory, "logs");
-Directory.CreateDirectory(logsDirectory);
-
-var databasePath = Path.Combine(dataDirectory, "heap_sort.db");
-
-builder.Services.AddSingleton(new AppEnvironmentPaths(databasePath, logsDirectory));
-builder.Services.AddSingleton<DBManager>(sp =>
-{
-    var paths = sp.GetRequiredService<AppEnvironmentPaths>();
-    var manager = new DBManager();
-    if (!manager.Initialize(paths.DatabasePath))
-    {
-        throw new InvalidOperationException($"Не удалось инициализировать базу данных по пути {paths.DatabasePath}");
-    }
-
-    return manager;
-});
-builder.Services.AddSingleton<AuthTokenService>();
-builder.Services.AddSingleton<UserArrayStore>();
-builder.Services.AddSingleton<HeapSortService>();
-
+var paths = EnsureEnvironmentPaths(AppContext.BaseDirectory);
+var db = CreateDbManager(paths.DatabasePath);
+var tokens = new AuthTokenService();
+var store = new UserArrayStore();
+var sorter = new HeapSortService();
 var app = builder.Build();
 
-app.UseSwagger();
-app.UseSwaggerUI();
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new
+        {
+            message = "Произошла ошибка. Повторите запрос позже."
+        });
+    });
+});
 
 app.MapGet("/", () => Results.Ok("Сервер пирамидальной сортировки готов к работе."));
 
-app.MapPost("/auth/register", ([FromBody] AuthRequest request, DBManager db, AuthTokenService tokens) =>
+app.MapPost("/auth/register", ([FromBody] AuthRequest request) =>
     RegisterUser(request, db, tokens));
 
-app.MapPost("/auth/login", ([FromBody] AuthRequest request, DBManager db, AuthTokenService tokens) =>
+app.MapPost("/auth/login", ([FromBody] AuthRequest request) =>
     LoginUser(request, db, tokens));
 
-app.MapPost("/auth/logout", (HttpContext context, AuthTokenService tokens) =>
+app.MapPost("/auth/logout", (HttpContext context) =>
     LogoutUser(context, tokens));
 
-app.MapPost("/array/upload", ([FromBody] ArrayUploadRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store, DBManager db, AppEnvironmentPaths paths) =>
-    UploadArray(request, context, tokens, store, db, paths));
+app.MapPost("/array/upload", ([FromBody] ArrayUploadRequest request, HttpContext context) =>
+    UploadArray(request, context, tokens, store, db));
 
-app.MapPost("/array/generate", ([FromBody] RandomArrayRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store) =>
+app.MapPost("/array/generate", ([FromBody] RandomArrayRequest request, HttpContext context) =>
     GenerateArray(request, context, tokens, store));
 
-app.MapPost("/array/add", ([FromBody] AddElementsRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store) =>
+app.MapPost("/array/add", ([FromBody] AddElementsRequest request, HttpContext context) =>
     AppendElements(request, context, tokens, store));
 
-app.MapGet("/array", (HttpContext context, AuthTokenService tokens, UserArrayStore store) =>
+app.MapGet("/array", (HttpContext context) =>
     GetStoredArray(context, tokens, store));
 
-app.MapDelete("/array", (HttpContext context, AuthTokenService tokens, UserArrayStore store) =>
+app.MapDelete("/array", (HttpContext context) =>
     ClearStoredArray(context, tokens, store));
 
-app.MapPost("/sort", ([FromBody] SortRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store, HeapSortService sorter, DBManager db, AppEnvironmentPaths paths) =>
-    SortCurrentArray(request, context, tokens, store, sorter, db, paths));
+app.MapPost("/sort", ([FromBody] SortRequest request, HttpContext context) =>
+    SortCurrentArray(request, context, tokens, store, sorter, db));
 
 
 app.Run();
 
 static IResult RegisterUser(AuthRequest request, DBManager db, AuthTokenService tokens)
 {
-    if (request == null)
-    {
-        return Results.BadRequest(new { message = "Тело запроса не должно быть пустым." });
-    }
-
+    if (request == null) return Err(StatusCodes.Status400BadRequest, "Пустой запрос.");
     if (string.IsNullOrWhiteSpace(request.Login) || string.IsNullOrWhiteSpace(request.Password))
-    {
-        return Results.BadRequest(new { message = "Логин и пароль обязательны для регистрации." });
-    }
+        return Err(StatusCodes.Status400BadRequest, "Нужны логин и пароль.");
 
     var normalizedLogin = request.Login.Trim();
 
     if (!db.AddUser(normalizedLogin, request.Password))
     {
-        return Results.Conflict(new { message = $"Пользователь {normalizedLogin} уже существует или данные некорректны." });
+        return Err(StatusCodes.Status409Conflict, $"Пользователь {normalizedLogin} уже существует.");
     }
 
     var token = tokens.GenerateToken(normalizedLogin);
@@ -110,14 +81,11 @@ static IResult RegisterUser(AuthRequest request, DBManager db, AuthTokenService 
 
 static IResult LoginUser(AuthRequest request, DBManager db, AuthTokenService tokens)
 {
-    if (request == null)
-    {
-        return Results.BadRequest(new { message = "Тело запроса не должно быть пустым." });
-    }
+    if (request == null) return Err(StatusCodes.Status400BadRequest, "Пустой запрос.");
 
     if (!db.CheckUser(request.Login, request.Password))
     {
-        return Results.Unauthorized();
+        return Err(StatusCodes.Status401Unauthorized, "Неверные данные.");
     }
 
     var token = tokens.GenerateToken(request.Login.Trim());
@@ -135,17 +103,14 @@ static IResult LogoutUser(HttpContext context, AuthTokenService tokens)
     return Results.Ok(new { message = $"Пользователь {login} успешно вышел из системы." });
 }
 
-static IResult UploadArray(ArrayUploadRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store, DBManager db, AppEnvironmentPaths paths)
+static IResult UploadArray(ArrayUploadRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store, DBManager db)
 {
     if (!TryAuthorize(context.Request, tokens, out var login, out _, out var errorResult))
     {
         return errorResult;
     }
 
-    if (request == null)
-    {
-        return Results.BadRequest(new { message = "Тело запроса не должно быть пустым." });
-    }
+    if (request == null) return Err(StatusCodes.Status400BadRequest, "Пустой запрос.");
 
     int[] numbers;
     string? sourcePath = null;
@@ -158,27 +123,22 @@ static IResult UploadArray(ArrayUploadRequest request, HttpContext context, Auth
     else if (!string.IsNullOrWhiteSpace(request.SourceFilePath))
     {
         sourcePath = request.SourceFilePath;
-        if (!Path.IsPathRooted(sourcePath))
-        {
-            return Results.BadRequest(new { message = "Путь к файлу должен быть абсолютным." });
-        }
+        if (!Path.IsPathRooted(sourcePath)) return Err(StatusCodes.Status400BadRequest, "Путь должен быть абсолютным.");
 
         if (!File.Exists(sourcePath))
         {
             var error = $"Файл {sourcePath} не найден.";
-            db.LogErrorToFile(paths.LogsDirectory, error);
-            return Results.NotFound(new { message = error });
+            return Err(StatusCodes.Status404NotFound, error);
         }
 
         if (!TryReadNumbersFromFile(sourcePath, out numbers, out var parseError))
         {
-            db.LogErrorToFile(paths.LogsDirectory, $"Не удалось прочитать массив из файла {sourcePath}: {parseError}");
-            return Results.BadRequest(new { message = parseError });
+            return Err(StatusCodes.Status400BadRequest, parseError ?? "Ошибка чтения файла.");
         }
     }
     else
     {
-        return Results.BadRequest(new { message = "Необходимо передать массив чисел или путь к файлу." });
+        return Err(StatusCodes.Status400BadRequest, "Нужен массив или путь к файлу.");
     }
 
     store.SetArray(login, numbers, sourcePath);
@@ -198,27 +158,16 @@ static IResult GenerateArray(RandomArrayRequest request, HttpContext context, Au
         return errorResult;
     }
 
-    if (request == null)
-    {
-        return Results.BadRequest(new { message = "Тело запроса не должно быть пустым." });
-    }
+    if (request == null) return Err(StatusCodes.Status400BadRequest, "Пустой запрос.");
 
-    if (request.Length <= 0 || request.Length > 100_000)
-    {
-        return Results.BadRequest(new { message = "Длина массива должна быть в диапазоне от 1 до 100000." });
-    }
+    if (request.Length <= 0 || request.Length > 100_000) return Err(StatusCodes.Status400BadRequest, "Длина 1..100000.");
 
-    if (request.MinValue > request.MaxValue)
-    {
-        return Results.BadRequest(new { message = "Минимальное значение не может превышать максимальное." });
-    }
-
-    if (request.MaxValue == int.MaxValue)
-    {
-        return Results.BadRequest(new { message = "Максимальное значение должно быть меньше int.MaxValue." });
-    }
+    if (request.MinValue > request.MaxValue) return Err(StatusCodes.Status400BadRequest, "Min > Max.");
+    
+    if (request.MaxValue == int.MaxValue) return Err(StatusCodes.Status400BadRequest, "Max меньше int.Max.");
 
     var numbers = new int[request.Length];
+    
     var maxExclusive = request.MaxValue + 1;
 
     for (var i = 0; i < numbers.Length; i++)
@@ -243,24 +192,13 @@ static IResult AppendElements(AddElementsRequest request, HttpContext context, A
         return errorResult;
     }
 
-    if (request == null)
-    {
-        return Results.BadRequest(new { message = "Тело запроса не должно быть пустым." });
-    }
-
-    if (request.Values == null || request.Values.Count == 0)
-    {
-        return Results.BadRequest(new { message = "Список добавляемых элементов не может быть пустым." });
-    }
-
-    if (!store.TryGetArray(login, out var stored))
-    {
-        return Results.NotFound(new { message = "У пользователя нет сохранённого массива." });
-    }
+    if (request == null) return Err(StatusCodes.Status400BadRequest, "Пустой запрос.");
+    if (request.Values == null || request.Values.Count == 0) return Err(StatusCodes.Status400BadRequest, "Нет элементов.");
+    if (!store.TryGetArray(login, out var stored)) return Err(StatusCodes.Status404NotFound, "Массив не найден.");
 
     if (!store.TryAppendValues(login, request.Placement, request.Values.ToArray(), request.AfterIndex, out var updatedArray, out var error))
     {
-        return Results.BadRequest(new { message = error });
+        return Err(StatusCodes.Status400BadRequest, error ?? "Ошибка обновления.");
     }
 
     return Results.Ok(new
@@ -278,10 +216,7 @@ static IResult GetStoredArray(HttpContext context, AuthTokenService tokens, User
         return errorResult;
     }
 
-    if (!store.TryGetArray(login, out var stored))
-    {
-        return Results.NotFound(new { message = "У пользователя нет сохранённого массива." });
-    }
+    if (!store.TryGetArray(login, out var stored)) return Err(StatusCodes.Status404NotFound, "Массив не найден.");
 
     return Results.Ok(new
     {
@@ -298,25 +233,19 @@ static IResult ClearStoredArray(HttpContext context, AuthTokenService tokens, Us
         return errorResult;
     }
 
-    if (!store.ClearArray(login))
-    {
-        return Results.NotFound(new { message = "У пользователя нет сохранённого массива." });
-    }
+    if (!store.ClearArray(login)) return Err(StatusCodes.Status404NotFound, "Массив не найден.");
 
     return Results.Ok(new { message = $"Массив пользователя {login} удалён." });
 }
 
-static IResult SortCurrentArray(SortRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store, HeapSortService sorter, DBManager db, AppEnvironmentPaths paths)
+static IResult SortCurrentArray(SortRequest request, HttpContext context, AuthTokenService tokens, UserArrayStore store, HeapSortService sorter, DBManager db)
 {
     if (!TryAuthorize(context.Request, tokens, out var login, out _, out var errorResult))
     {
         return errorResult;
     }
 
-    if (!store.TryGetArray(login, out var stored))
-    {
-        return Results.NotFound(new { message = "Перед сортировкой необходимо загрузить массив." });
-    }
+    if (!store.TryGetArray(login, out var stored)) return Err(StatusCodes.Status404NotFound, "Нет массива.");
 
     var options = request?.OutputOptions ?? new SortOutputOptions();
 
@@ -325,10 +254,9 @@ static IResult SortCurrentArray(SortRequest request, HttpContext context, AuthTo
     {
         sortResult = sorter.Sort(stored.Numbers, request?.RangeStart, request?.RangeEnd);
     }
-    catch (Exception ex)
+    catch (Exception)
     {
-        db.LogErrorToFile(paths.LogsDirectory, $"Ошибка сортировки для пользователя {login}: {ex.Message}");
-        return Results.BadRequest(new { message = ex.Message });
+        return Err(StatusCodes.Status400BadRequest, "Ошибка сортировки.");
     }
 
     store.SetArray(login, sortResult.SortedNumbers, stored.SourceFilePath);
@@ -375,31 +303,31 @@ static bool TryAuthorize(HttpRequest request, AuthTokenService tokens, out strin
 {
     login = string.Empty;
     token = string.Empty;
-    errorResult = CreateUnauthorized("Необходима авторизация.");
+    errorResult = Err(StatusCodes.Status401Unauthorized, "Нужна авторизация.");
 
     if (!request.Headers.TryGetValue("Authorization", out var headerValues))
     {
-        errorResult = CreateUnauthorized("Отсутствует заголовок Authorization.");
+        errorResult = Err(StatusCodes.Status401Unauthorized, "Нет Authorization.");
         return false;
     }
 
     var headerValue = headerValues.ToString();
     if (!headerValue.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
     {
-        errorResult = CreateUnauthorized("Неверный формат заголовка Authorization. Ожидается Bearer токен.");
+        errorResult = Err(StatusCodes.Status401Unauthorized, "Ожидается Bearer токен.");
         return false;
     }
 
     token = headerValue.Substring("Bearer ".Length).Trim();
     if (token.Length == 0)
     {
-        errorResult = CreateUnauthorized("Токен авторизации не может быть пустым.");
+        errorResult = Err(StatusCodes.Status401Unauthorized, "Токен пуст.");
         return false;
     }
 
     if (!tokens.TryValidateToken(token, out login))
     {
-        errorResult = CreateUnauthorized("Токен авторизации недействителен.");
+        errorResult = Err(StatusCodes.Status401Unauthorized, "Токен недействителен.");
         return false;
     }
 
@@ -446,32 +374,28 @@ static bool TryReadNumbersFromFile(string filePath, out int[] numbers, out strin
     }
 }
 
-static IResult CreateUnauthorized(string message)
+static IResult Err(int statusCode, string message) =>
+    Results.Json(new { message }, statusCode: statusCode);
+
+static AppEnvironmentPaths EnsureEnvironmentPaths(string baseDirectory)
 {
-    return Results.Json(new { message }, statusCode: StatusCodes.Status401Unauthorized);
+    var dataDirectory = Path.Combine(baseDirectory, "data");
+    Directory.CreateDirectory(dataDirectory);
+
+    var databasePath = Path.Combine(dataDirectory, "heap_sort.db");
+
+    return new AppEnvironmentPaths(databasePath);
 }
 
-static string NormalizeServerUrl(string raw)
+static DBManager CreateDbManager(string databasePath)
 {
-    var trimmed = (raw ?? string.Empty).Trim();
-
-    if (string.IsNullOrEmpty(trimmed))
+    var manager = new DBManager();
+    if (manager.Initialize(databasePath))
     {
-        return "http://localhost:5000";
+        return manager;
     }
 
-    if (int.TryParse(trimmed, out var port))
-    {
-        return $"http://localhost:{port}";
-    }
-
-    if (!trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
-        !trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-    {
-        trimmed = $"http://{trimmed}";
-    }
-
-    return trimmed.TrimEnd('/');
+    throw new InvalidOperationException("Не удалось инициализировать базу данных.");
 }
 
-public sealed record AppEnvironmentPaths(string DatabasePath, string LogsDirectory);
+public sealed record AppEnvironmentPaths(string DatabasePath);

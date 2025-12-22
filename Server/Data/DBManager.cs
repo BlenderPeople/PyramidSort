@@ -2,7 +2,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
-using System.Text;
 using Microsoft.Data.Sqlite;
 
 public class DBManager
@@ -18,18 +17,17 @@ public class DBManager
             return false;
         }
 
-        try
+        var directory = Path.GetDirectoryName(dbPath);
+        if (!string.IsNullOrEmpty(directory))
         {
-            var directory = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(directory))
+            try
             {
                 Directory.CreateDirectory(directory);
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("Не удалось создать каталог базы данных: " + ex.Message);
-            return false;
+            catch (Exception ex)
+            {
+                return Fail("Не удалось создать каталог базы данных: ", ex);
+            }
         }
 
         databasePath = dbPath;
@@ -80,8 +78,7 @@ public class DBManager
         }
         catch (Exception ex)
         {
-            Console.WriteLine("Ошибка добавления пользователя: " + ex.Message);
-            return false;
+            return Fail("Ошибка добавления пользователя: ", ex);
         }
     }
 
@@ -116,23 +113,7 @@ public class DBManager
         }
         catch (Exception ex)
         {
-            Console.WriteLine("Ошибка проверки пользователя: " + ex.Message);
-            return false;
-        }
-    }
-
-    public void LogErrorToFile(string logsDirectory, string message)
-    {
-        try
-        {
-            Directory.CreateDirectory(logsDirectory);
-            var filePath = Path.Combine(logsDirectory, "errors.log");
-            var fullMessage = $"{DateTimeOffset.UtcNow:o} | {message}{Environment.NewLine}";
-            File.AppendAllText(filePath, fullMessage, Encoding.UTF8);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("Не удалось записать ошибку в файл: " + ex.Message);
+            return Fail("Ошибка проверки пользователя: ", ex);
         }
     }
 
@@ -158,8 +139,7 @@ public class DBManager
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Ошибка подключения к базе данных: " + ex.Message);
-                return false;
+                return Fail("Ошибка подключения к базе данных: ", ex);
             }
         }
     }
@@ -181,8 +161,7 @@ public class DBManager
         }
         catch (Exception ex)
         {
-            Console.WriteLine("Ошибка создания схемы базы данных: " + ex.Message);
-            return false;
+            return Fail("Ошибка создания схемы базы данных: ", ex);
         }
     }
 
@@ -208,6 +187,12 @@ public class DBManager
         {
             return false;
         }
+    }
+
+    private bool Fail(string message, Exception ex)
+    {
+        Console.WriteLine(message + ex.Message);
+        return false;
     }
 }
 
